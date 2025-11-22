@@ -35,6 +35,8 @@ const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const CONFIRMATIONS_TO_WAIT = 10;
 const MAX_QUEUE_LENGTH = 500;
 const MAX_REQUESTS_PER_SECOND = 100;
+const MAX_STORED_JOBS = 1000;
+const JOB_TIMEOUT_MS = 5 * 60 * 1000;
 
 const rpcProvider = new ethers.JsonRpcProvider(RPC_URL);
 const hubReadContract = new ethers.Contract(HUB_ADDRESS, HUB_ABI, rpcProvider);
@@ -82,6 +84,7 @@ const jobQueue: OnboardJob[] = [];
 let queueProcessorRunning = false;
 let rateLimitTokens = MAX_REQUESTS_PER_SECOND;
 let lastRefillTimestamp = Date.now();
+const completedJobIds: string[] = [];
 
 const app = express();
 app.use(express.json());
@@ -92,7 +95,7 @@ app.use((
   next: express.NextFunction,
 ) => {
   if (err instanceof SyntaxError) {
-    return res.status(400).json({ error: 'Malformed JSON body' });
+    return res.status(400).json({ message: 'Malformed JSON body' });
   }
   next(err);
 });
@@ -105,7 +108,7 @@ function validateApiKey(
   const apiKey = req.headers['x-api-key'];
 
   if (!apiKey || apiKey !== api_key) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(401).json({ message: 'Unauthorized' });
   }
 
   next();
@@ -116,19 +119,19 @@ app.post('/onboard', validateApiKey, async (req, res) => {
     if (isRateLimited()) {
       const message = 'Rate limit exceeded';
       await notifySlack(`429 rate limit: ${message}`);
-      return res.status(429).json({ error: message });
+      return res.status(429).json({ message });
     }
 
     if (jobQueue.length >= MAX_QUEUE_LENGTH) {
       const message = 'Too many requests in queue, try again later';
       await notifySlack(`429 backpressure: ${message}`);
-      return res.status(429).json({ error: message });
+      return res.status(429).json({ message });
     }
 
     const { address } = req.body ?? {};
 
     if (typeof address !== 'string') {
-      return res.status(400).json({ error: 'Invalid Ethereum address. Only checksum address allowed' });
+      return res.status(400).json({ message: 'Invalid Ethereum address. Only checksum address allowed' });
     }
 
     let normalizedAddress: string;
@@ -136,7 +139,7 @@ app.post('/onboard', validateApiKey, async (req, res) => {
       normalizedAddress = validateAndChecksumAddress(address);
     } catch (err) {
       return res.status(400).json({
-        error: err instanceof Error ? err.message : 'Invalid Ethereum address',
+        message: err instanceof Error ? err.message : 'Invalid Ethereum address',
       });
     }
 
@@ -154,10 +157,10 @@ app.post('/onboard', validateApiKey, async (req, res) => {
 
     res.status(202).json(responseForJob(job));
   } catch (error) {
-    console.error(error);
+    console.error('Unhandled onboard error', error);
     await notifySlack(`Unhandled onboard error: ${error instanceof Error ? error.message : String(error)}`);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Internal server error',
+      message: 'Unable to process request',
     });
   }
 });
@@ -165,7 +168,7 @@ app.post('/onboard', validateApiKey, async (req, res) => {
 app.get('/status/:jobId', (req, res) => {
   const job = jobsById.get(req.params.jobId);
   if (!job) {
-    return res.status(404).json({ error: 'Job not found' });
+    return res.status(404).json({ message: 'Job not found' });
   }
 
   res.status(200).json(responseForJob(job));
@@ -173,6 +176,16 @@ app.get('/status/:jobId', (req, res) => {
 
 app.get('/health', (_req, res) => {
   res.status(200).json({ message: 'OK' });
+});
+
+app.use((
+  err: unknown,
+  _req: express.Request,
+  res: express.Response,
+  _next: express.NextFunction,
+) => {
+  console.error('Unhandled error', err);
+  res.status(500).json({ message: 'Unable to process request' });
 });
 
 app.listen(3000, () => {
@@ -214,6 +227,7 @@ function enqueueJob(address: string): OnboardJob {
   jobsById.set(job.id, job);
   addressToJobId.set(address.toLowerCase(), job.id);
   jobQueue.push(job);
+  pruneStoredJobs();
   return job;
 }
 
@@ -227,7 +241,11 @@ async function processQueue() {
 
     try {
       setJobStatus(job, 'processing');
-      const result = await performOnboarding(job);
+      const result = await withTimeout(
+        performOnboarding(job),
+        JOB_TIMEOUT_MS,
+        `Job ${job.id} (${job.address})`,
+      );
       job.result = result;
       setJobStatus(job, 'confirmed');
     } catch (error) {
@@ -246,8 +264,13 @@ async function processQueue() {
 }
 
 function setJobStatus(job: OnboardJob, status: JobStatus) {
+  const previousStatus = job.status;
   job.status = status;
   job.updatedAt = Date.now();
+  if (isTerminalStatus(status) && !isTerminalStatus(previousStatus)) {
+    completedJobIds.push(job.id);
+  }
+  pruneStoredJobs();
 }
 
 function responseForJob(job: OnboardJob) {
@@ -256,7 +279,6 @@ function responseForJob(job: OnboardJob) {
     status: job.status,
     address: job.address,
     result: job.result ?? null,
-    error: job.error ?? null,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   };
@@ -274,6 +296,36 @@ function findExistingJobForAddress(address: string) {
   }
 
   return job;
+}
+
+function isTerminalStatus(status: JobStatus) {
+  return status === 'confirmed' || status === 'failed';
+}
+
+function pruneStoredJobs() {
+  const activeCount = jobsById.size - completedJobIds.length;
+  const maxCompletedAllowed = Math.max(0, MAX_STORED_JOBS - activeCount);
+
+  while (completedJobIds.length > maxCompletedAllowed) {
+    const evictId = completedJobIds.shift();
+    if (!evictId) break;
+    const evictJob = jobsById.get(evictId);
+    if (!evictJob) continue;
+
+    jobsById.delete(evictId);
+    addressToJobId.delete(evictJob.address.toLowerCase());
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, context: string): Promise<T> {
+  let timeout: NodeJS.Timeout;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`${context} timed out after ${timeoutMs / 1000} seconds`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeout));
 }
 
 async function performOnboarding(job: OnboardJob): Promise<JobResult> {
