@@ -196,7 +196,7 @@ app.post('/onboard', validateApiKey, async (req, res) => {
   }
 });
 
-app.get('/status/:jobId', (req, res) => {
+app.get('/status/:jobId', validateApiKey, (req, res) => {
   const job = jobsById.get(req.params.jobId);
   if (!job) {
     return res.status(404).json({ message: 'Job not found' });
@@ -267,32 +267,37 @@ async function processQueue() {
   if (queueProcessorRunning) return;
   queueProcessorRunning = true;
 
-  while (jobQueue.length > 0) {
-    const job = jobQueue.shift();
-    if (!job) break;
+  try {
+    while (true) {
+      const job = jobQueue.shift();
+      if (!job) break;
 
-    try {
-      setJobStatus(job, 'processing');
-      const result = await withTimeout(
-        performOnboarding(job),
-        JOB_TIMEOUT_MS,
-        `Job ${job.id} (${job.address})`,
-      );
-      job.result = result;
-      setJobStatus(job, 'confirmed');
-    } catch (error) {
-      job.error = error instanceof Error ? error.message : 'Unknown error';
-      setJobStatus(job, 'failed');
-      logger.error({ err: error, jobId: job.id, address: job.address, errorMessage: job.error }, 'Job failed');
-      await notifySlack(`Job ${job.id} failed for ${job.address}: ${job.error}`);
-    } finally {
-      if (job.status === 'failed') {
-        addressToJobId.delete(job.address.toLowerCase());
+      try {
+        setJobStatus(job, 'processing');
+        const result = await withTimeout(
+          performOnboarding(job),
+          JOB_TIMEOUT_MS,
+          `Job ${job.id} (${job.address})`,
+        );
+        job.result = result;
+        setJobStatus(job, 'confirmed');
+      } catch (error) {
+        job.error = error instanceof Error ? error.message : 'Unknown error';
+        setJobStatus(job, 'failed');
+        logger.error({ err: error, jobId: job.id, address: job.address, errorMessage: job.error }, 'Job failed');
+        await notifySlack(`Job ${job.id} failed for ${job.address}: ${job.error}`);
+      } finally {
+        if (job.status === 'failed') {
+          addressToJobId.delete(job.address.toLowerCase());
+        }
       }
     }
+  } finally {
+    queueProcessorRunning = false;
+    if (jobQueue.length > 0) {
+      void processQueue();
+    }
   }
-
-  queueProcessorRunning = false;
 }
 
 function setJobStatus(job: OnboardJob, status: JobStatus) {

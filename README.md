@@ -3,7 +3,7 @@
 ## Prerequisites
 - Node.js 18+ recommended
 - npm
-- Access to the configured Gnosis Chain RPC (defaults to `https://rpc.gnosischain.com`)
+- Access to the configured Gnosis Chain RPC 
 
 ## Configuration
 Create a `.env` file in the project root:
@@ -80,12 +80,16 @@ Job payload shape:
 ### GET /status/:jobId
 Polls a job created by `/onboard`.
 
+- Headers:
+  - `x-api-key: $API_KEY`
+
 - `200 OK` with the job payload.
 - `404 Not Found` if the `jobId` is unknown.
 
 Example:
 ```
-curl http://localhost:3000/status/5e9a8c7d-3c6f-4b5e-a9d4-123456789abc
+curl http://localhost:3000/status/5e9a8c7d-3c6f-4b5e-a9d4-123456789abc \
+  -H "x-api-key: $API_KEY"
 ```
 
 ### GET /health
