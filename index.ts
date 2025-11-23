@@ -33,7 +33,7 @@ const HUB_ABI = [
 ];
 const INVITE_AMOUNT = ethers.parseUnits('96', 18);
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
-const CONFIRMATIONS_TO_WAIT = 10;
+const CONFIRMATIONS_TO_WAIT = 5;
 const MAX_QUEUE_LENGTH = 500;
 const MAX_REQUESTS_PER_SECOND = 100;
 const MAX_STORED_JOBS = 1000;
@@ -440,9 +440,13 @@ async function getInviterSafe(): Promise<any> {
 function ensureSuccessfulReceipt(
   receipt: ethers.TransactionReceipt | null | undefined,
   context: string,
-) {
+): ethers.TransactionReceipt {
   if (!receipt) {
     throw new Error(`${context} transaction did not return a receipt`);
+  }
+
+  if (receipt.status !== 1) {
+    throw new Error(`${context} transaction failed on-chain (status ${receipt.status})`);
   }
 
   return receipt;
