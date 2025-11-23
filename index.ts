@@ -3,6 +3,7 @@ import express from 'express';
 import { ethers } from 'ethers';
 import { randomUUID } from 'crypto';
 import Safe from '@safe-global/protocol-kit';
+import pino from 'pino';
 
 dotenv.config();
 
@@ -37,7 +38,9 @@ const MAX_QUEUE_LENGTH = 500;
 const MAX_REQUESTS_PER_SECOND = 100;
 const MAX_STORED_JOBS = 1000;
 const JOB_TIMEOUT_MS = 5 * 60 * 1000;
+const LOG_LEVEL = process.env.LOG_LEVEL ?? 'info';
 
+const logger = pino({ level: LOG_LEVEL });
 const rpcProvider = new ethers.JsonRpcProvider(RPC_URL);
 const hubReadContract = new ethers.Contract(HUB_ADDRESS, HUB_ABI, rpcProvider);
 const trustSignerWallet = new ethers.Wallet(SIGNER, rpcProvider);
@@ -88,13 +91,15 @@ const completedJobIds: string[] = [];
 
 const app = express();
 app.use(express.json());
+app.use(logRequestReceived);
 app.use((
   err: unknown,
-  _req: express.Request,
+  req: express.Request,
   res: express.Response,
   next: express.NextFunction,
 ) => {
   if (err instanceof SyntaxError) {
+    logger.warn({ err, path: req.path }, 'Malformed JSON body');
     return res.status(400).json({ message: 'Malformed JSON body' });
   }
   next(err);
@@ -114,16 +119,39 @@ function validateApiKey(
   next();
 }
 
+function logRequestReceived(
+  req: express.Request,
+  _res: express.Response,
+  next: express.NextFunction,
+) {
+  if (req.path === '/health') return next();
+
+  const logContext: Record<string, unknown> = {
+    method: req.method,
+    path: req.path,
+    queueLength: jobQueue.length,
+  };
+
+  if (req.method === 'POST' && typeof req.body?.address === 'string') {
+    logContext.address = req.body.address;
+  }
+
+  logger.info(logContext, 'Request received');
+  next();
+}
+
 app.post('/onboard', validateApiKey, async (req, res) => {
   try {
     if (isRateLimited()) {
       const message = 'Rate limit exceeded';
+      logger.warn({ address: req.body?.address }, 'Rate limit exceeded');
       await notifySlack(`429 rate limit: ${message}`);
       return res.status(429).json({ message });
     }
 
     if (jobQueue.length >= MAX_QUEUE_LENGTH) {
       const message = 'Too many requests in queue, try again later';
+      logger.warn({ queueLength: jobQueue.length }, 'Queue length exceeded');
       await notifySlack(`429 backpressure: ${message}`);
       return res.status(429).json({ message });
     }
@@ -131,6 +159,7 @@ app.post('/onboard', validateApiKey, async (req, res) => {
     const { address } = req.body ?? {};
 
     if (typeof address !== 'string') {
+      logger.warn({ body: req.body }, 'Invalid address payload');
       return res.status(400).json({ message: 'Invalid Ethereum address. Only checksum address allowed' });
     }
 
@@ -138,6 +167,7 @@ app.post('/onboard', validateApiKey, async (req, res) => {
     try {
       normalizedAddress = validateAndChecksumAddress(address);
     } catch (err) {
+      logger.warn({ address }, 'Address validation failed');
       return res.status(400).json({
         message: err instanceof Error ? err.message : 'Invalid Ethereum address',
       });
@@ -146,18 +176,19 @@ app.post('/onboard', validateApiKey, async (req, res) => {
     const existingJob = findExistingJobForAddress(normalizedAddress);
     if (existingJob) {
       const statusCode = existingJob.status === 'confirmed' ? 200 : 202;
+      logger.info({ jobId: existingJob.id, address: normalizedAddress, status: existingJob.status }, 'Existing job lookup');
       return res.status(statusCode).json(responseForJob(existingJob));
     }
 
     const job = enqueueJob(normalizedAddress);
     processQueue().catch(async (err) => {
-      console.error('Queue processor failed', err);
+      logger.error({ err }, 'Queue processor failed');
       await notifySlack(`Queue processor failure: ${err instanceof Error ? err.message : String(err)}`);
     });
 
     res.status(202).json(responseForJob(job));
   } catch (error) {
-    console.error('Unhandled onboard error', error);
+    logger.error({ err: error }, 'Unhandled onboard error');
     await notifySlack(`Unhandled onboard error: ${error instanceof Error ? error.message : String(error)}`);
     res.status(500).json({
       message: 'Unable to process request',
@@ -184,12 +215,12 @@ app.use((
   res: express.Response,
   _next: express.NextFunction,
 ) => {
-  console.error('Unhandled error', err);
+  logger.error({ err }, 'Unhandled error');
   res.status(500).json({ message: 'Unable to process request' });
 });
 
 app.listen(3000, () => {
-  console.log('Server is running on port 3000');
+  logger.info('Server is running on port 3000');
 });
 
 function validateAndChecksumAddress(address: string) {
@@ -227,6 +258,7 @@ function enqueueJob(address: string): OnboardJob {
   jobsById.set(job.id, job);
   addressToJobId.set(address.toLowerCase(), job.id);
   jobQueue.push(job);
+  logger.info({ jobId: job.id, address, queueLength: jobQueue.length }, 'Enqueued onboarding job');
   pruneStoredJobs();
   return job;
 }
@@ -251,7 +283,7 @@ async function processQueue() {
     } catch (error) {
       job.error = error instanceof Error ? error.message : 'Unknown error';
       setJobStatus(job, 'failed');
-      console.error('Job failed', job.id, job.error);
+      logger.error({ err: error, jobId: job.id, address: job.address, errorMessage: job.error }, 'Job failed');
       await notifySlack(`Job ${job.id} failed for ${job.address}: ${job.error}`);
     } finally {
       if (job.status === 'failed') {
@@ -265,6 +297,15 @@ async function processQueue() {
 
 function setJobStatus(job: OnboardJob, status: JobStatus) {
   const previousStatus = job.status;
+  if (previousStatus !== status) {
+    logger.info({
+      jobId: job.id,
+      address: job.address,
+      previousStatus,
+      status,
+      queueLength: jobQueue.length,
+    }, 'Job status updated');
+  }
   job.status = status;
   job.updatedAt = Date.now();
   if (isTerminalStatus(status) && !isTerminalStatus(previousStatus)) {
@@ -336,6 +377,14 @@ async function performOnboarding(job: OnboardJob): Promise<JobResult> {
   setJobStatus(job, 'submitted');
 
   const invite = isHuman ? null : await claimInviteAndTransfer(normalizedAddress, CONFIRMATIONS_TO_WAIT);
+  logger.info({
+    jobId: job.id,
+    address: normalizedAddress,
+    isHuman,
+    inviteId: invite?.inviteId ?? null,
+    gnosisPayGroupTxHash: txHashes.gnosisPayGroupTxHash,
+    dublinGroupTxHash: txHashes.dublinGroupTxHash,
+  }, 'Onboarding completed');
 
   return {
     address: normalizedAddress,
@@ -358,7 +407,7 @@ async function notifySlack(message: string) {
       body: JSON.stringify({ text: message }),
     });
   } catch (error) {
-    console.error('Failed to notify Slack', error);
+    logger.error({ err: error }, 'Failed to notify Slack');
   }
 }
 
@@ -404,7 +453,7 @@ async function checkIsHuman(address: string): Promise<boolean> {
     const humanStatus = await hubReadContract.isHuman(address);
     return Boolean(humanStatus);
   } catch (error) {
-    console.error(`Failed to check human status for ${address}`, error);
+    logger.error({ err: error, address }, 'Failed to check human status');
     throw new Error('Unable to verify human status');
   }
 }
