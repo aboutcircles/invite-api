@@ -38,6 +38,7 @@ const MAX_QUEUE_LENGTH = 500;
 const MAX_REQUESTS_PER_SECOND = 100;
 const MAX_STORED_JOBS = 1000;
 const JOB_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_INVITE_ATTEMPTS = 3;
 const LOG_LEVEL = process.env.LOG_LEVEL ?? 'info';
 
 const logger = pino({ level: LOG_LEVEL });
@@ -47,7 +48,6 @@ const trustSignerWallet = new ethers.Wallet(SIGNER, rpcProvider);
 const gnosisPayGroup = new ethers.Contract(GNOSIS_PAY_GROUP_ADDRESS, TRUST_GROUP_ABI, trustSignerWallet);
 const dublinGroup = new ethers.Contract(DUBLIN_GROUP_ADDRESS, TRUST_GROUP_ABI, trustSignerWallet);
 const invitationFarmInterface = new ethers.Interface(INVITATION_FARM_ABI);
-const transferSingleTopic = invitationFarmInterface.getEvent('TransferSingle')?.topicHash;
 
 let inviterSafeInstance: unknown | null = null;
 let inviterSafeInitPromise: Promise<unknown> | null = null;
@@ -377,11 +377,21 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, context: string)
 async function performOnboarding(job: OnboardJob): Promise<JobResult> {
   const normalizedAddress = job.address;
 
-  const isHuman = await checkIsHuman(normalizedAddress);
+  let isHuman = await checkIsHuman(normalizedAddress);
+  let invite: JobResult['invite'] = null;
+
+  if (!isHuman) {
+    invite = await claimInviteAndTransfer(normalizedAddress, CONFIRMATIONS_TO_WAIT);
+    isHuman = await checkIsHuman(normalizedAddress);
+
+    if (!isHuman) {
+      throw new Error('Address is not human after invite claim');
+    }
+  }
+
   const txHashes = await trustAcrossGroups(normalizedAddress, CONFIRMATIONS_TO_WAIT);
   setJobStatus(job, 'submitted');
 
-  const invite = isHuman ? null : await claimInviteAndTransfer(normalizedAddress, CONFIRMATIONS_TO_WAIT);
   logger.info({
     jobId: job.id,
     address: normalizedAddress,
@@ -467,77 +477,74 @@ async function checkIsHuman(address: string): Promise<boolean> {
   }
 }
 
-function extractInviteIdFromReceipt(receipt: ethers.TransactionReceipt) {
-  if (!transferSingleTopic) {
-    throw new Error('TransferSingle topic unavailable');
-  }
-
-  const log = receipt.logs.find(
-    (entry) =>
-      entry.address.toLowerCase() === INVITATION_FARM_ADDRESS.toLowerCase()
-      && entry.topics[0] === transferSingleTopic,
-  );
-
-  if (!log) {
-    throw new Error('Invite id not found in receipt');
-  }
-
-  const parsed = invitationFarmInterface.parseLog(log);
-  if (!parsed?.args?.id) {
-    throw new Error('Invite id missing from receipt');
-  }
-
-  return parsed.args.id.toString();
-}
-
 async function claimInviteAndTransfer(address: string, confirmationsToWait: number) {
   return enqueueInviteTask(async () => {
-    const claimInviteCalldata = invitationFarmInterface.encodeFunctionData('claimInvite', []);
-    const returnData = await rpcProvider.call({
-      to: INVITATION_FARM_ADDRESS,
-      from: INVITER_SAFE_ADDRESS,
-      data: claimInviteCalldata,
-    });
-    const [expectedInviteId] = invitationFarmInterface.decodeFunctionResult('claimInvite', returnData);
+    let lastError: unknown;
 
-    const transferData = ethers.AbiCoder.defaultAbiCoder().encode(['address'], [address]);
-    const hubInterface = new ethers.Interface(HUB_ABI);
-    const transferTxData = hubInterface.encodeFunctionData('safeTransferFrom', [
-      INVITER_SAFE_ADDRESS,
-      INVITATION_MODULE,
-      expectedInviteId,
-      INVITE_AMOUNT,
-      transferData,
-    ]);
-
-    const safe = await getInviterSafe();
-    const safeTx = await safe.createTransaction({
-      transactions: [
-        { to: INVITATION_FARM_ADDRESS, data: claimInviteCalldata, value: '0' },
-        { to: HUB_ADDRESS, data: transferTxData, value: '0' },
-      ],
-    });
-
-    const execution = await safe.executeTransaction(safeTx);
-    const txResponse = execution.transactionResponse as ethers.TransactionResponse | undefined;
-
-    if (!txResponse) {
-      throw new Error('No transaction response returned from Safe execution');
+    for (let attempt = 1; attempt <= MAX_INVITE_ATTEMPTS; attempt++) {
+      try {
+        return await executeClaimInviteAndTransfer(address, confirmationsToWait);
+      } catch (error) {
+        lastError = error;
+        logger.warn({
+          err: error,
+          address,
+          attempt,
+        }, attempt < MAX_INVITE_ATTEMPTS ? 'Invite claim attempt failed, retrying' : 'Invite claim attempt failed');
+      }
     }
 
-    const combinedReceipt = ensureSuccessfulReceipt(await txResponse.wait(confirmationsToWait), 'Invite batch');
-    const inviteId = extractInviteIdFromReceipt(combinedReceipt);
-
-    if (inviteId !== expectedInviteId.toString()) {
-      throw new Error(`Invite id mismatch. Expected ${expectedInviteId.toString()}, got ${inviteId}`);
+    const message = `Invite claim failed after ${MAX_INVITE_ATTEMPTS} attempts`;
+    if (lastError instanceof Error) {
+      throw new Error(`${message}: ${lastError.message}`);
     }
 
-    return {
-      inviteId,
-      claimTxHash: combinedReceipt.hash,
-      transferTxHash: combinedReceipt.hash,
-    };
+    throw new Error(message);
   });
+}
+
+async function executeClaimInviteAndTransfer(address: string, confirmationsToWait: number) {
+  const claimInviteCalldata = invitationFarmInterface.encodeFunctionData('claimInvite', []);
+  const returnData = await rpcProvider.call({
+    to: INVITATION_FARM_ADDRESS,
+    from: INVITER_SAFE_ADDRESS,
+    data: claimInviteCalldata,
+  });
+  const [expectedInviteId] = invitationFarmInterface.decodeFunctionResult('claimInvite', returnData);
+  const inviteId = expectedInviteId.toString();
+
+  const transferData = ethers.AbiCoder.defaultAbiCoder().encode(['address'], [address]);
+  const hubInterface = new ethers.Interface(HUB_ABI);
+  const transferTxData = hubInterface.encodeFunctionData('safeTransferFrom', [
+    INVITER_SAFE_ADDRESS,
+    INVITATION_MODULE,
+    expectedInviteId,
+    INVITE_AMOUNT,
+    transferData,
+  ]);
+
+  const safe = await getInviterSafe();
+  const safeTx = await safe.createTransaction({
+    transactions: [
+      { to: INVITATION_FARM_ADDRESS, data: claimInviteCalldata, value: '0' },
+      { to: HUB_ADDRESS, data: transferTxData, value: '0' },
+    ],
+  });
+
+  const execution = await safe.executeTransaction(safeTx);
+  const txResponse = execution.transactionResponse as ethers.TransactionResponse | undefined;
+
+  if (!txResponse) {
+    throw new Error('No transaction response returned from Safe execution');
+  }
+
+  const combinedReceipt = ensureSuccessfulReceipt(await txResponse.wait(confirmationsToWait), 'Invite batch');
+
+  return {
+    inviteId,
+    claimTxHash: combinedReceipt.hash,
+    transferTxHash: combinedReceipt.hash,
+  };
 }
 
 async function trustAcrossGroups(address: string, confirmationsToWait: number) {
