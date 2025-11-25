@@ -19,6 +19,7 @@ const INVITER_SAFE_ADDRESS = '0x20EcD8bDeb2F48d8a7c94E542aA4feC5790D9676';
 const HUB_ADDRESS = '0xc12C1E50ABB450d6205Ea2C3Fa861b3B834d13e8';
 const INVITATION_FARM_ADDRESS = '0xd28b7C4f148B1F1E190840A1f7A796C5525D8902';
 const INVITATION_MODULE = '0x00738aca013B7B2e6cfE1690F0021C3182Fa40B5';
+const DELAY_MODULE_ENDPOINT = 'https://gnosis-e702590.dedicated.hyperindex.xyz/v1/graphql';
 const GNOSIS_PAY_GROUP_ADDRESS = '0xb629a1e86F3eFada0F87C83494Da8Cc34C3F84ef';
 const DUBLIN_GROUP_ADDRESS = '0xAeCda439CC8Ac2a2da32bE871E0C2D7155350f80';
 const TRUST_EXPIRY = BigInt('79228162514264337593543950335');
@@ -74,6 +75,7 @@ type JobResult = {
 type OnboardJob = {
   id: string;
   address: string;
+  safeAddress?: string | null;
   status: JobStatus;
   createdAt: number;
   updatedAt: number;
@@ -180,7 +182,38 @@ app.post('/onboard', validateApiKey, async (req, res) => {
       return res.status(statusCode).json(responseForJob(existingJob));
     }
 
-    const job = enqueueJob(normalizedAddress);
+    let safeAddress: string | null;
+    let isHuman: boolean;
+
+    try {
+      [isHuman, safeAddress] = await Promise.all([
+        checkIsHuman(normalizedAddress),
+        fetchDelayModuleSafeAddress(normalizedAddress),
+      ]);
+    } catch (error) {
+      logger.error({ err: error, address: normalizedAddress }, 'Eligibility checks failed. Address is either a human already or does not have a valid GP safe');
+      return res.status(500).json({
+        message: error instanceof Error ? error.message : 'Unable to process request. Address is either a human already or does not have a valid GP safe',
+      });
+    }
+
+    if (isHuman) {
+      logger.info({ address: normalizedAddress }, 'Address already human, skipping onboarding');
+      return res.status(400).json({
+        status: 'failed',
+        message: 'Account is already verified as human',
+      });
+    }
+
+    if (!safeAddress) {
+      logger.info({ address: normalizedAddress }, 'DelayModule Safe not found for address');
+      return res.status(400).json({
+        status: 'failed',
+        message: 'Account does not have a valid GP card',
+      });
+    }
+
+    const job = enqueueJob(normalizedAddress, safeAddress);
     processQueue().catch(async (err) => {
       logger.error({ err }, 'Queue processor failed');
       await notifySlack(`Queue processor failure: ${err instanceof Error ? err.message : String(err)}`);
@@ -246,10 +279,11 @@ function isRateLimited(): boolean {
   return false;
 }
 
-function enqueueJob(address: string): OnboardJob {
+function enqueueJob(address: string, safeAddress?: string | null): OnboardJob {
   const job: OnboardJob = {
     id: randomUUID(),
     address,
+    safeAddress: safeAddress ?? null,
     status: 'queued',
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -377,17 +411,10 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, context: string)
 async function performOnboarding(job: OnboardJob): Promise<JobResult> {
   const normalizedAddress = job.address;
 
-  let isHuman = await checkIsHuman(normalizedAddress);
-  let invite: JobResult['invite'] = null;
+  const safeAddress = job.safeAddress ?? await fetchDelayModuleSafeAddress(normalizedAddress);
+  if (!safeAddress) throw new Error('Address has no associated Safe in DelayModule indexer');
 
-  if (!isHuman) {
-    invite = await claimInviteAndTransfer(normalizedAddress, CONFIRMATIONS_TO_WAIT);
-    isHuman = await checkIsHuman(normalizedAddress);
-
-    if (!isHuman) {
-      throw new Error('Address is not human after invite claim');
-    }
-  }
+  const invite = await claimInviteAndTransfer(normalizedAddress, CONFIRMATIONS_TO_WAIT);
 
   const txHashes = await trustAcrossGroups(normalizedAddress, CONFIRMATIONS_TO_WAIT);
   setJobStatus(job, 'submitted');
@@ -395,7 +422,7 @@ async function performOnboarding(job: OnboardJob): Promise<JobResult> {
   logger.info({
     jobId: job.id,
     address: normalizedAddress,
-    isHuman,
+    isHuman: true,
     inviteId: invite?.inviteId ?? null,
     gnosisPayGroupTxHash: txHashes.gnosisPayGroupTxHash,
     dublinGroupTxHash: txHashes.dublinGroupTxHash,
@@ -403,7 +430,7 @@ async function performOnboarding(job: OnboardJob): Promise<JobResult> {
 
   return {
     address: normalizedAddress,
-    isHuman,
+    isHuman: true,
     invite,
     transactions: {
       gnosisPayGroup: txHashes.gnosisPayGroupTxHash,
@@ -434,9 +461,9 @@ function enqueueNonceTask<T>(task: () => Promise<T>): Promise<T> {
 
 function enqueueInviteTask<T>(task: () => Promise<T>): Promise<T> {
   const run = inviteQueue.then(task);
-  inviteQueue = run.then(() => undefined, () => undefined);
-  return run;
-}
+    inviteQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
 
 async function getInviterSafe(): Promise<any> {
   if (inviterSafeInstance) return inviterSafeInstance;
@@ -545,6 +572,56 @@ async function executeClaimInviteAndTransfer(address: string, confirmationsToWai
     claimTxHash: combinedReceipt.hash,
     transferTxHash: combinedReceipt.hash,
   };
+}
+
+async function fetchDelayModuleSafeAddress(ownerAddress: string): Promise<string | null> {
+  const query = `
+    query DelayModuleByOwner($address: String) {
+      Metri_Pay_DelayModule(where: { owners: { ownerAddress: { _eq: $address } } }) {
+        safeAddress
+      }
+    }
+  `;
+
+  let response: Response;
+  try {
+    response = await fetch(DELAY_MODULE_ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        variables: { address: ownerAddress },
+      }),
+    });
+  } catch (error) {
+    logger.error({ err: error, address: ownerAddress }, 'DelayModule lookup failed to reach endpoint');
+    throw new Error('Unable to verify Safe ownership');
+  }
+
+  if (!response.ok) {
+    const body = await response.text();
+    logger.error({
+      address: ownerAddress,
+      status: response.status,
+      statusText: response.statusText,
+      body,
+    }, 'DelayModule lookup HTTP error');
+    throw new Error('Unable to verify Safe ownership');
+  }
+
+  const json = await response.json() as {
+    data?: { Metri_Pay_DelayModule?: Array<{ safeAddress?: string | null }> };
+    errors?: unknown;
+  };
+
+  if (json.errors) {
+    logger.error({ errors: json.errors, address: ownerAddress }, 'DelayModule lookup GraphQL error');
+    throw new Error('Unable to verify Safe ownership');
+  }
+
+  const modules = json.data?.Metri_Pay_DelayModule ?? [];
+  const match = modules.find((module) => typeof module.safeAddress === 'string' && module.safeAddress.length > 0);
+  return match?.safeAddress ?? null;
 }
 
 async function trustAcrossGroups(address: string, confirmationsToWait: number) {
