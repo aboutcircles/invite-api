@@ -9,9 +9,9 @@
 Create a `.env` file in the project root:
 
 ```
-API_KEY=            
-TRUST_PRIVATE_KEY=        
-SLACK_WEBHOOK_URL=
+API_KEY=                
+PRIVATE_KEY=            
+SLACK_WEBHOOK_URL= 
 ```
 
 ## Install & Run
@@ -52,6 +52,13 @@ curl -X POST http://localhost:3000/onboard \
   -d '{"address":"0x742d35Cc6634C0532925a3b844Bc454e4438f44e"}'
 ```
 
+- Success enqueues a job and returns `202 Accepted`. If the same address already has a job, returns that job with `200` when confirmed or `202` while pending.
+- Invalid address → `400`.
+- Address already marked human → `400` with `status: "failed"`.
+- Address without a DelayModule Safe → `400` with `status: "failed"`.
+- Backpressure (rate/queue) → `429`.
+- Unexpected server error → `500`.
+
 Job payload shape:
 ```
 {
@@ -59,23 +66,18 @@ Job payload shape:
   "status": "queued | processing | submitted | confirmed | failed",
   "address": "0x...",
   "result": {
-    "address": "0x...",
-    "isHuman": false,
     "invite": {
       "inviteId": "123",
       "claimTxHash": "0x...",
       "transferTxHash": "0x..."
     },
-    "transactions": {
-      "gnosisPayGroup": "0x...",
-      "dublinGroup": "0x..."
-    }
-  },
+    "address": "0x..."
+  } | null,
   "createdAt": 1730000000000,
   "updatedAt": 1730000005000
 }
 ```
-`result` is `null` until the job finishes. `invite` is `null` when the address is already marked human.
+`result` is `null` until the job finishes or fails.
 
 ### GET /status/:jobId
 Polls a job created by `/onboard`.
